@@ -2,10 +2,13 @@
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
+build/
+dist/
 
-# Virtual environment (force ignore everything inside)
-venv/*
-venv/**
+# Virtual environment
+venv/
+.venv/
 
 # Model weights
 *.pt
@@ -15,6 +18,15 @@ venv/**
 videos/*
 *.mp4
 *.avi
+*.mov
+*.mkv
+
+# Test / lint caches
+.pytest_cache/
+.ruff_cache/
+
+# Streamlit
+.streamlit/
 
 # OS
 .DS_Store
