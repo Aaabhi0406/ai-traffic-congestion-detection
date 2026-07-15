@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install lightweight test dependencies
+        # Deliberately NOT installing ultralytics/torch/deep-sort-realtime
+        # here — they're heavyweight (GB-scale with CUDA wheels) and would
+        # need yolov8s.pt downloaded to actually exercise. The pure-logic
+        # tests (signal timing, ROI geometry, feature engineering, line
+        # crossing) only need these:
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy opencv-python-headless scikit-learn pandas pytest ruff
+
+      - name: Lint with ruff
+        run: ruff check src/ tests/
+
+      - name: Run tests
+        run: pytest tests/ -v
