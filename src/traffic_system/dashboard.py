@@ -1,27 +1,36 @@
 """
-dashboard.py — Streamlit Traffic Management Dashboard
+dashboard.py — Streamlit Traffic Management Dashboard.
 
 Run with:
-    streamlit run dashboard.py
+    streamlit run src/traffic_system/dashboard.py
 
 Features:
-  • BOTH videos available directly in the sidebar — no manual typing needed
-  • Auto-scans the videos/ folder for any additional video files
-  • Live video feed with vehicle detection + tracking overlays
+  • Both bundled demo videos selectable from the sidebar, plus auto-scan of
+    any extra files dropped into videos/
+  • Live video feed with detection + tracking overlays
   • Real-time vehicle count, type breakdown, weighted density
-  • Adaptive green light time recommendation
+  • Adaptive green-light time recommendation
   • ML-predicted future traffic density (Random Forest)
-  • Rolling charts for density history
+  • Rolling chart of density history
   • Traffic level status card
+
+All detection/tracking/signal-timing logic is shared with cli.py via
+pipeline.TrafficPipeline — this file is presentation only.
 """
 
-import streamlit as st
-import cv2
-import numpy as np
-import pandas as pd
+from __future__ import annotations
+
 import time
 from collections import deque
 from pathlib import Path
+
+import cv2
+import pandas as pd
+import streamlit as st
+
+from traffic_system import config
+from traffic_system.detection import get_model
+from traffic_system.pipeline import TrafficPipeline
 
 # ─── Page config ─────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -139,7 +148,6 @@ html, body, [class*="css"] {
     transition: width 0.4s ease;
 }
 
-/* Video selector cards */
 .video-card {
     background: #111827;
     border: 1px solid #2a3550;
@@ -169,28 +177,18 @@ section[data-testid="stSidebar"] { background: #0d1117; border-right: 1px solid 
 """, unsafe_allow_html=True)
 
 
-# ─── Helper: scan available videos ───────────────────────────────────────────
-KNOWN_VIDEOS = {
-    "14552311-hd_1920_1080_50fps.mp4": "Video 1 · 50fps · 1080p",
-    "15300538-hd_1920_1080_60fps.mp4": "Video 2 · 60fps · 1080p",
-}
-
 def scan_videos() -> list[dict]:
-    """
-    Return list of dicts: {path, label, exists}
-    - First lists the two known videos (whether they exist or not)
-    - Then appends any extra .mp4/.avi/.mov files found in videos/
-    """
+    """Return [{path, label, exists, fname}], known videos first, then any
+    extra .mp4/.avi/.mov/.mkv files found in videos/."""
     video_dir = Path("videos")
     result = []
     seen = set()
 
-    for fname, label in KNOWN_VIDEOS.items():
+    for fname, label in config.KNOWN_VIDEOS.items():
         p = video_dir / fname
         result.append({"path": str(p), "label": label, "exists": p.exists(), "fname": fname})
         seen.add(fname)
 
-    # Pick up any extra videos the user dropped in
     if video_dir.exists():
         for f in sorted(video_dir.iterdir()):
             if f.suffix.lower() in (".mp4", ".avi", ".mov", ".mkv") and f.name not in seen:
@@ -216,8 +214,6 @@ with st.sidebar:
         st.error("No video files found in the `videos/` folder.\nAdd at least one .mp4 file and refresh.")
         st.stop()
 
-    # Build radio options (show all available)
-    video_labels = [f"📹 {v['label']}\n`{v['fname']}`" for v in available]
     chosen_idx = st.radio(
         "Available videos",
         range(len(available)),
@@ -226,7 +222,6 @@ with st.sidebar:
     )
     video_source = available[chosen_idx]["path"]
 
-    # Show info about chosen file
     chosen = available[chosen_idx]
     p = Path(chosen["path"])
     size_mb = p.stat().st_size / (1024 * 1024) if p.exists() else 0
@@ -238,7 +233,6 @@ with st.sidebar:
 </div>
 """, unsafe_allow_html=True)
 
-    # Show missing videos notice
     missing = [v for v in videos if not v["exists"]]
     if missing:
         with st.expander("⚠ Missing videos"):
@@ -246,30 +240,40 @@ with st.sidebar:
                 st.markdown(f"<span style='color:#ff4444;font-size:0.7rem'>`{m['fname']}`</span>", unsafe_allow_html=True)
 
     st.markdown("<div class='section-title'>Model & Settings</div>", unsafe_allow_html=True)
-    model_path = st.selectbox("YOLO Model", ["yolov8s.pt", "yolov8m.pt", "yolov8n.pt"], index=0)
-    conf_threshold = st.slider("Detection Confidence", 0.1, 0.9, 0.3, 0.05)
+    model_path = st.selectbox(
+        "YOLO Model", ["yolov8s.pt", "yolov8m.pt", "yolov8n.pt"], index=0,
+        help="yolov8m.pt/yolov8n.pt aren't bundled with this repo — Ultralytics "
+             "will auto-download them on first use if you have internet access.",
+    )
+    conf_floor = st.slider(
+        "Minimum confidence (floor)", 0.1, 0.9, config.DEFAULT_MIN_CONF, 0.05,
+        help="Raises every class's confidence threshold to at least this value. "
+             "It can only make detection stricter than the tuned per-class "
+             "defaults, never looser.",
+    )
     process_every = st.slider("Process every N frames", 1, 5, 1)
     max_history = st.slider("Chart history (frames)", 50, 300, 100, 10)
 
     st.markdown("<div class='section-title'>System Architecture</div>", unsafe_allow_html=True)
-    st.markdown("""
+    st.markdown(f"""
 <small style='color:#6b7a9a'>
 <b style='color:#00e5ff'>① ROI (Region of Interest)</b><br>
 Trapezoid zone on video. Only vehicles whose centre falls inside are counted (green boxes).<br><br>
 <b style='color:#00d4ff'>② Counting Line</b><br>
 Cyan horizontal line inside ROI. Counts every vehicle that crosses top→bottom (throughput).<br><br>
 <b style='color:#ffaa00'>③ Per-class Detection</b><br>
-Car/bus/truck: conf ≥ 0.40 · Motorcycle/Bicycle: conf ≥ 0.18. Runs at imgsz=1280 so small vehicles appear larger in model input → far more detections.<br><br>
+Car/bus/truck: conf ≥ {config.CONF_PER_CLASS[2]:.2f} · Motorcycle/Bicycle: conf ≥ {config.CONF_PER_CLASS[3]:.2f}.
+Runs at imgsz={config.YOLO_IMGSZ} so small vehicles appear larger in model input → far more detections.<br><br>
 <b style='color:#ff9900'>④ DeepSort Tracker</b><br>
 Assigns persistent orange #ID labels. Does NOT affect vehicle count.<br><br>
 <b style='color:#a855f7'>⑤ Random Forest Prediction</b><br>
-Predicts density 15 frames (~0.5s) ahead. Features: 30-frame rolling window of weighted density (mean, std, slope, rate-of-change).
+Predicts density {config.RF_PREDICT_HORIZON} frames (~0.5s) ahead. Features: {config.RF_WINDOW_SIZE}-frame rolling window of weighted density (mean, std, slope, rate-of-change).
 </small>
 """, unsafe_allow_html=True)
 
     st.markdown("<div class='section-title'>Controls</div>", unsafe_allow_html=True)
     start_btn = st.button("▶ Start Processing", use_container_width=True, type="primary")
-    stop_btn  = st.button("■ Stop", use_container_width=True)
+    stop_btn = st.button("■ Stop", use_container_width=True)
 
 
 # ─── Main layout ─────────────────────────────────────────────────────────────
@@ -297,13 +301,13 @@ with col_stats:
 
     m_col1, m_col2 = st.columns(2)
     with m_col1:
-        vehicles_ph = st.empty()   # vehicles inside ROI this frame
+        vehicles_ph = st.empty()
     with m_col2:
-        weight_ph = st.empty()     # traffic level
+        weight_ph = st.empty()
 
     m_col3, m_col4 = st.columns(2)
     with m_col3:
-        crossing_ph = st.empty()   # line-crossing total
+        crossing_ph = st.empty()
     with m_col4:
         signal_ph = st.empty()
 
@@ -323,12 +327,14 @@ if "history" not in st.session_state:
     st.session_state.history = deque(maxlen=300)
 if "last_video" not in st.session_state:
     st.session_state.last_video = None
+if "pipeline" not in st.session_state:
+    st.session_state.pipeline = TrafficPipeline()
 
 if start_btn:
-    # Reset history when switching videos
     if st.session_state.last_video != video_source:
         st.session_state.history = deque(maxlen=300)
         st.session_state.last_video = video_source
+        st.session_state.pipeline.reset()
     st.session_state.running = True
 if stop_btn:
     st.session_state.running = False
@@ -375,7 +381,7 @@ def pred_panel(pred_density: float, pred_level: str, confidence: float, trained:
     return f"""
 <div class='metric-card' style='--accent:#a855f7'>
   <div style='display:flex;justify-content:space-between;align-items:center'>
-    <div class='label'>Predicted Density (0.5s ahead)</div>
+    <div class='label'>Predicted Density ({config.RF_PREDICT_HORIZON} frames ahead)</div>
     <div style='font-family:JetBrains Mono,monospace;font-size:0.65rem;color:#a855f7'>{status}</div>
   </div>
   <div style='display:flex;align-items:baseline;gap:12px;margin-top:4px'>
@@ -391,9 +397,7 @@ def pred_panel(pred_density: float, pred_level: str, confidence: float, trained:
 
 # ─── Processing loop ─────────────────────────────────────────────────────────
 if st.session_state.running:
-    from traffic_core import get_model, process_frame
-    from signal_logic import density_predictor
-
+    pipeline: TrafficPipeline = st.session_state.pipeline
     src = 0 if "Webcam" in str(video_source) else video_source
     cap = cv2.VideoCapture(src)
 
@@ -418,7 +422,7 @@ if st.session_state.running:
                 if frame_idx % process_every != 0:
                     continue
 
-                result = process_frame(frame.copy(), model)
+                result = pipeline.process_frame(frame.copy(), model, min_conf_override=conf_floor)
 
                 st.session_state.history.append({
                     "frame": frame_idx,
@@ -455,7 +459,7 @@ if st.session_state.running:
                 pred_ph.markdown(
                     pred_panel(result["pred_density"], result["pred_level"],
                                result["pred_confidence"],
-                               density_predictor._is_trained),
+                               pipeline.density_predictor.is_trained),
                     unsafe_allow_html=True)
 
                 if result["vehicle_types"]:
@@ -481,7 +485,6 @@ if st.session_state.running:
             cap.release()
 
 else:
-    # ── Idle state ──
     video_placeholder.markdown("""
 <div style='height:360px;display:flex;flex-direction:column;align-items:center;
             justify-content:center;background:#111827;border-radius:12px;
